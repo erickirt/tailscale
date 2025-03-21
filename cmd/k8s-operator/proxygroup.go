@@ -302,7 +302,10 @@ func (r *ProxyGroupReconciler) maybeProvision(ctx context.Context, pg *tsapi.Pro
 	if err != nil {
 		return fmt.Errorf("error generating StatefulSet spec: %w", err)
 	}
-	ss = applyProxyClassToStatefulSet(proxyClass, ss, nil, logger)
+	cfg := &tailscaleSTSConfig{
+		proxyType: string(pg.Spec.Type),
+	}
+	ss = applyProxyClassToStatefulSet(proxyClass, ss, cfg, logger)
 	capver, err := r.capVerForPG(ctx, pg, logger)
 	if err != nil {
 		return fmt.Errorf("error getting device info: %w", err)
@@ -461,7 +464,7 @@ func (r *ProxyGroupReconciler) ensureConfigSecretsCreated(ctx context.Context, p
 
 		var existingCfgSecret *corev1.Secret // unmodified copy of secret
 		if err := r.Get(ctx, client.ObjectKeyFromObject(cfgSecret), cfgSecret); err == nil {
-			logger.Debugf("secret %s/%s already exists", cfgSecret.GetNamespace(), cfgSecret.GetName())
+			logger.Debugf("Secret %s/%s already exists", cfgSecret.GetNamespace(), cfgSecret.GetName())
 			existingCfgSecret = cfgSecret.DeepCopy()
 		} else if !apierrors.IsNotFound(err) {
 			return "", err
@@ -469,7 +472,7 @@ func (r *ProxyGroupReconciler) ensureConfigSecretsCreated(ctx context.Context, p
 
 		var authKey string
 		if existingCfgSecret == nil {
-			logger.Debugf("creating authkey for new ProxyGroup proxy")
+			logger.Debugf("Creating authkey for new ProxyGroup proxy")
 			tags := pg.Spec.Tags.Stringify()
 			if len(tags) == 0 {
 				tags = r.defaultTags
@@ -490,7 +493,7 @@ func (r *ProxyGroupReconciler) ensureConfigSecretsCreated(ctx context.Context, p
 			if err != nil {
 				return "", fmt.Errorf("error marshalling tailscaled config: %w", err)
 			}
-			mak.Set(&cfgSecret.StringData, tsoperator.TailscaledConfigFileName(cap), string(cfgJSON))
+			mak.Set(&cfgSecret.Data, tsoperator.TailscaledConfigFileName(cap), cfgJSON)
 		}
 
 		// The config sha256 sum is a value for a hash annotation used to trigger
@@ -520,12 +523,14 @@ func (r *ProxyGroupReconciler) ensureConfigSecretsCreated(ctx context.Context, p
 		}
 
 		if existingCfgSecret != nil {
-			logger.Debugf("patching the existing ProxyGroup config Secret %s", cfgSecret.Name)
-			if err := r.Patch(ctx, cfgSecret, client.MergeFrom(existingCfgSecret)); err != nil {
-				return "", err
+			if !apiequality.Semantic.DeepEqual(existingCfgSecret, cfgSecret) {
+				logger.Debugf("Updating the existing ProxyGroup config Secret %s", cfgSecret.Name)
+				if err := r.Update(ctx, cfgSecret); err != nil {
+					return "", err
+				}
 			}
 		} else {
-			logger.Debugf("creating a new config Secret %s for the ProxyGroup", cfgSecret.Name)
+			logger.Debugf("Creating a new config Secret %s for the ProxyGroup", cfgSecret.Name)
 			if err := r.Create(ctx, cfgSecret); err != nil {
 				return "", err
 			}
@@ -645,7 +650,7 @@ func (r *ProxyGroupReconciler) getNodeMetadata(ctx context.Context, pg *tsapi.Pr
 			return nil, fmt.Errorf("unexpected secret %s was labelled as owned by the ProxyGroup %s: %w", secret.Name, pg.Name, err)
 		}
 
-		id, dnsName, ok, err := getNodeMetadata(ctx, &secret)
+		prefs, ok, err := getDevicePrefs(&secret)
 		if err != nil {
 			return nil, err
 		}
@@ -656,8 +661,8 @@ func (r *ProxyGroupReconciler) getNodeMetadata(ctx context.Context, pg *tsapi.Pr
 		nm := nodeMetadata{
 			ordinal:     ordinal,
 			stateSecret: &secret,
-			tsID:        id,
-			dnsName:     dnsName,
+			tsID:        prefs.Config.NodeID,
+			dnsName:     prefs.Config.UserProfile.LoginName,
 		}
 		pod := &corev1.Pod{}
 		if err := r.Get(ctx, client.ObjectKey{Namespace: r.tsNamespace, Name: secret.Name}, pod); err != nil && !apierrors.IsNotFound(err) {

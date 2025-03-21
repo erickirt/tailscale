@@ -22,6 +22,7 @@ import (
 	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -154,13 +155,13 @@ func (r *HAIngressReconciler) maybeProvision(ctx context.Context, hostname strin
 	pg := &tsapi.ProxyGroup{}
 	if err := r.Get(ctx, client.ObjectKey{Name: pgName}, pg); err != nil {
 		if apierrors.IsNotFound(err) {
-			logger.Infof("ProxyGroup %q does not exist", pgName)
+			logger.Infof("ProxyGroup does not exist")
 			return false, nil
 		}
 		return false, fmt.Errorf("getting ProxyGroup %q: %w", pgName, err)
 	}
 	if !tsoperator.ProxyGroupIsReady(pg) {
-		logger.Infof("ProxyGroup %q is not (yet) ready", pgName)
+		logger.Infof("ProxyGroup is not (yet) ready")
 		return false, nil
 	}
 
@@ -174,8 +175,6 @@ func (r *HAIngressReconciler) maybeProvision(ctx context.Context, hostname strin
 	if !IsHTTPSEnabledOnTailnet(r.tsnetServer) {
 		r.recorder.Event(ing, corev1.EventTypeWarning, "HTTPSNotEnabled", "HTTPS is not enabled on the tailnet; ingress may not work")
 	}
-
-	logger = logger.With("proxy-group", pg.Name)
 
 	if !slices.Contains(ing.Finalizers, FinalizerNamePG) {
 		// This log line is printed exactly once during initial provisioning,
@@ -229,12 +228,11 @@ func (r *HAIngressReconciler) maybeProvision(ctx context.Context, hostname strin
 			return false, fmt.Errorf("error getting VIPService %q: %w", hostname, err)
 		}
 	}
-	// Generate the VIPService comment for new or existing VIPService. This
-	// checks and ensures that VIPService's owner references are updated for
-	// this Ingress and errors if that is not possible (i.e. because it
-	// appears that the VIPService has been created by a non-operator
-	// actor).
-	svcComment, err := r.ownerRefsComment(existingVIPSvc)
+	// Generate the VIPService owner annotation for new or existing VIPService.
+	// This checks and ensures that VIPService's owner references are updated
+	// for this Ingress and errors if that is not possible (i.e. because it
+	// appears that the VIPService has been created by a non-operator actor).
+	updatedAnnotations, err := r.ownerAnnotations(existingVIPSvc)
 	if err != nil {
 		const instr = "To proceed, you can either manually delete the existing VIPService or choose a different MagicDNS name at `.spec.tls.hosts[0] in the Ingress definition"
 		msg := fmt.Sprintf("error ensuring ownership of VIPService %s: %v. %s", hostname, err, instr)
@@ -242,8 +240,12 @@ func (r *HAIngressReconciler) maybeProvision(ctx context.Context, hostname strin
 		r.recorder.Event(ing, corev1.EventTypeWarning, "InvalidVIPService", msg)
 		return false, nil
 	}
+	// 3. Ensure that TLS Secret and RBAC exists
+	if err := r.ensureCertResources(ctx, pgName, dnsName); err != nil {
+		return false, fmt.Errorf("error ensuring cert resources: %w", err)
+	}
 
-	// 3. Ensure that the serve config for the ProxyGroup contains the VIPService.
+	// 4. Ensure that the serve config for the ProxyGroup contains the VIPService.
 	cm, cfg, err := r.proxyGroupServeConfig(ctx, pgName)
 	if err != nil {
 		return false, fmt.Errorf("error getting Ingress serve config: %w", err)
@@ -310,11 +312,13 @@ func (r *HAIngressReconciler) maybeProvision(ctx context.Context, hostname strin
 		vipPorts = append(vipPorts, "80")
 	}
 
+	const managedVIPServiceComment = "This VIPService is managed by the Tailscale Kubernetes Operator, do not modify"
 	vipSvc := &tailscale.VIPService{
-		Name:    serviceName,
-		Tags:    tags,
-		Ports:   vipPorts,
-		Comment: svcComment,
+		Name:        serviceName,
+		Tags:        tags,
+		Ports:       vipPorts,
+		Comment:     managedVIPServiceComment,
+		Annotations: updatedAnnotations,
 	}
 	if existingVIPSvc != nil {
 		vipSvc.Addrs = existingVIPSvc.Addrs
@@ -325,8 +329,8 @@ func (r *HAIngressReconciler) maybeProvision(ctx context.Context, hostname strin
 	if existingVIPSvc == nil ||
 		!reflect.DeepEqual(vipSvc.Tags, existingVIPSvc.Tags) ||
 		!reflect.DeepEqual(vipSvc.Ports, existingVIPSvc.Ports) ||
-		!strings.EqualFold(vipSvc.Comment, existingVIPSvc.Comment) {
-		logger.Infof("Ensuring VIPService %q exists and is up to date", hostname)
+		!ownersAreSetAndEqual(vipSvc, existingVIPSvc) {
+		logger.Infof("Ensuring VIPService exists and is up to date")
 		if err := r.tsClient.CreateOrUpdateVIPService(ctx, vipSvc); err != nil {
 			return false, fmt.Errorf("error creating VIPService: %w", err)
 		}
@@ -338,31 +342,48 @@ func (r *HAIngressReconciler) maybeProvision(ctx context.Context, hostname strin
 		return false, fmt.Errorf("failed to update tailscaled config: %w", err)
 	}
 
-	// TODO(irbekrm): check that the replicas are ready to route traffic for the VIPService before updating Ingress
-	// status.
-	// 6. Update Ingress status
+	// 6. Update Ingress status if ProxyGroup Pods are ready.
+	count, err := r.numberPodsAdvertising(ctx, pg.Name, serviceName)
+	if err != nil {
+		return false, fmt.Errorf("failed to check if any Pods are configured: %w", err)
+	}
+
 	oldStatus := ing.Status.DeepCopy()
-	ports := []networkingv1.IngressPortStatus{
-		{
-			Protocol: "TCP",
-			Port:     443,
-		},
+
+	switch count {
+	case 0:
+		ing.Status.LoadBalancer.Ingress = nil
+	default:
+		ports := []networkingv1.IngressPortStatus{
+			{
+				Protocol: "TCP",
+				Port:     443,
+			},
+		}
+		if isHTTPEndpointEnabled(ing) {
+			ports = append(ports, networkingv1.IngressPortStatus{
+				Protocol: "TCP",
+				Port:     80,
+			})
+		}
+		ing.Status.LoadBalancer.Ingress = []networkingv1.IngressLoadBalancerIngress{
+			{
+				Hostname: dnsName,
+				Ports:    ports,
+			},
+		}
 	}
-	if isHTTPEndpointEnabled(ing) {
-		ports = append(ports, networkingv1.IngressPortStatus{
-			Protocol: "TCP",
-			Port:     80,
-		})
-	}
-	ing.Status.LoadBalancer.Ingress = []networkingv1.IngressLoadBalancerIngress{
-		{
-			Hostname: dnsName,
-			Ports:    ports,
-		},
-	}
-	if apiequality.Semantic.DeepEqual(oldStatus, ing.Status) {
+	if apiequality.Semantic.DeepEqual(oldStatus, &ing.Status) {
 		return svcsChanged, nil
 	}
+
+	const prefix = "Updating Ingress status"
+	if count == 0 {
+		logger.Infof("%s. No Pods are advertising VIPService yet", prefix)
+	} else {
+		logger.Infof("%s. %d Pod(s) advertising VIPService", prefix, count)
+	}
+
 	if err := r.Status().Update(ctx, ing); err != nil {
 		return false, fmt.Errorf("failed to update Ingress status: %w", err)
 	}
@@ -402,24 +423,24 @@ func (r *HAIngressReconciler) maybeCleanupProxyGroup(ctx context.Context, proxyG
 			logger.Infof("VIPService %q is not owned by any Ingress, cleaning up", vipServiceName)
 
 			// Delete the VIPService from control if necessary.
-			svc, _ := r.tsClient.GetVIPService(ctx, vipServiceName)
-			if svc != nil && isVIPServiceForAnyIngress(svc) {
-				logger.Infof("cleaning up orphaned VIPService %q", vipServiceName)
-				svcsChanged, err = r.cleanupVIPService(ctx, vipServiceName, logger)
-				if err != nil {
-					errResp := &tailscale.ErrResponse{}
-					if !errors.As(err, &errResp) || errResp.Status != http.StatusNotFound {
-						return false, fmt.Errorf("deleting VIPService %q: %w", vipServiceName, err)
-					}
-				}
+			svcsChanged, err = r.cleanupVIPService(ctx, vipServiceName, logger)
+			if err != nil {
+				return false, fmt.Errorf("deleting VIPService %q: %w", vipServiceName, err)
 			}
 
 			// Make sure the VIPService is not advertised in tailscaled or serve config.
 			if err = r.maybeUpdateAdvertiseServicesConfig(ctx, proxyGroupName, vipServiceName, false, logger); err != nil {
 				return false, fmt.Errorf("failed to update tailscaled config services: %w", err)
 			}
-			delete(cfg.Services, vipServiceName)
-			serveConfigChanged = true
+			_, ok := cfg.Services[vipServiceName]
+			if ok {
+				logger.Infof("Removing VIPService %q from serve config", vipServiceName)
+				delete(cfg.Services, vipServiceName)
+				serveConfigChanged = true
+			}
+			if err := r.cleanupCertResources(ctx, proxyGroupName, vipServiceName); err != nil {
+				return false, fmt.Errorf("failed to clean up cert resources: %w", err)
+			}
 		}
 	}
 
@@ -480,16 +501,22 @@ func (r *HAIngressReconciler) maybeCleanup(ctx context.Context, hostname string,
 	if err != nil {
 		return false, fmt.Errorf("error deleting VIPService: %w", err)
 	}
+
+	// 3. Clean up any cluster resources
+	if err := r.cleanupCertResources(ctx, pg, serviceName); err != nil {
+		return false, fmt.Errorf("failed to clean up cert resources: %w", err)
+	}
+
 	if cfg == nil || cfg.Services == nil { // user probably deleted the ProxyGroup
 		return svcChanged, nil
 	}
 
-	// 3. Unadvertise the VIPService in tailscaled config.
+	// 4. Unadvertise the VIPService in tailscaled config.
 	if err = r.maybeUpdateAdvertiseServicesConfig(ctx, pg, serviceName, false, logger); err != nil {
 		return false, fmt.Errorf("failed to update tailscaled config services: %w", err)
 	}
 
-	// 4. Remove the VIPService from the serve config for the ProxyGroup.
+	// 5. Remove the VIPService from the serve config for the ProxyGroup.
 	logger.Infof("Removing VIPService %q from serve config for ProxyGroup %q", hostname, pg)
 	delete(cfg.Services, serviceName)
 	cfgBytes, err := json.Marshal(cfg)
@@ -570,13 +597,6 @@ func (r *HAIngressReconciler) shouldExpose(ing *networkingv1.Ingress) bool {
 	return isTSIngress && pgAnnot != ""
 }
 
-func isVIPServiceForAnyIngress(svc *tailscale.VIPService) bool {
-	if svc == nil {
-		return false
-	}
-	return strings.HasPrefix(svc.Comment, "tailscale.com/k8s-operator:owned-by:")
-}
-
 // validateIngress validates that the Ingress is properly configured.
 // Currently validates:
 // - Any tags provided via tailscale.com/tags annotation are valid Tailscale ACL tags
@@ -650,34 +670,34 @@ func (r *HAIngressReconciler) cleanupVIPService(ctx context.Context, name tailcf
 	if svc == nil {
 		return false, nil
 	}
-	c, err := parseComment(svc)
+	o, err := parseOwnerAnnotation(svc)
 	if err != nil {
-		return false, fmt.Errorf("error parsing VIPService comment")
+		return false, fmt.Errorf("error parsing VIPService owner annotation")
 	}
-	if c == nil || len(c.OwnerRefs) == 0 {
+	if o == nil || len(o.OwnerRefs) == 0 {
 		return false, nil
 	}
 	// Comparing with the operatorID only means that we will not be able to
 	// clean up VIPServices in cases where the operator was deleted from the
 	// cluster before deleting the Ingress. Perhaps the comparison could be
 	// 'if or.OperatorID === r.operatorID || or.ingressUID == r.ingressUID'.
-	ix := slices.IndexFunc(c.OwnerRefs, func(or OwnerRef) bool {
+	ix := slices.IndexFunc(o.OwnerRefs, func(or OwnerRef) bool {
 		return or.OperatorID == r.operatorID
 	})
 	if ix == -1 {
 		return false, nil
 	}
-	if len(c.OwnerRefs) == 1 {
+	if len(o.OwnerRefs) == 1 {
 		logger.Infof("Deleting VIPService %q", name)
 		return false, r.tsClient.DeleteVIPService(ctx, name)
 	}
-	c.OwnerRefs = slices.Delete(c.OwnerRefs, ix, ix+1)
+	o.OwnerRefs = slices.Delete(o.OwnerRefs, ix, ix+1)
 	logger.Infof("Deleting VIPService %q", name)
-	json, err := json.Marshal(c)
+	json, err := json.Marshal(o)
 	if err != nil {
 		return false, fmt.Errorf("error marshalling updated VIPService owner reference: %w", err)
 	}
-	svc.Comment = string(json)
+	svc.Annotations[ownerAnnotation] = string(json)
 	return true, r.tsClient.CreateOrUpdateVIPService(ctx, svc)
 }
 
@@ -740,6 +760,39 @@ func (a *HAIngressReconciler) maybeUpdateAdvertiseServicesConfig(ctx context.Con
 	return nil
 }
 
+func (a *HAIngressReconciler) numberPodsAdvertising(ctx context.Context, pgName string, serviceName tailcfg.ServiceName) (int, error) {
+	// Get all state Secrets for this ProxyGroup.
+	secrets := &corev1.SecretList{}
+	if err := a.List(ctx, secrets, client.InNamespace(a.tsNamespace), client.MatchingLabels(pgSecretLabels(pgName, "state"))); err != nil {
+		return 0, fmt.Errorf("failed to list ProxyGroup %q state Secrets: %w", pgName, err)
+	}
+
+	var count int
+	for _, secret := range secrets.Items {
+		prefs, ok, err := getDevicePrefs(&secret)
+		if err != nil {
+			return 0, fmt.Errorf("error getting node metadata: %w", err)
+		}
+		if !ok {
+			continue
+		}
+		if slices.Contains(prefs.AdvertiseServices, serviceName.String()) {
+			count++
+		}
+	}
+
+	return count, nil
+}
+
+const ownerAnnotation = "tailscale.com/owner-references"
+
+// ownerAnnotationValue is the content of the VIPService.Annotation[ownerAnnotation] field.
+type ownerAnnotationValue struct {
+	// OwnerRefs is a list of owner references that identify all operator
+	// instances that manage this VIPService.
+	OwnerRefs []OwnerRef `json:"ownerRefs,omitempty"`
+}
+
 // OwnerRef is an owner reference that uniquely identifies a Tailscale
 // Kubernetes operator instance.
 type OwnerRef struct {
@@ -747,60 +800,110 @@ type OwnerRef struct {
 	OperatorID string `json:"operatorID,omitempty"`
 }
 
-// comment is the content of the VIPService.Comment field.
-type comment struct {
-	// OwnerRefs is a list of owner references that identify all operator
-	// instances that manage this VIPService.
-	OwnerRefs []OwnerRef `json:"ownerRefs,omitempty"`
-}
-
-// ownerRefsComment return VIPService Comment that includes owner reference for this
-// operator instance for the provided VIPService. If the VIPService is nil, a
-// new comment with owner ref is returned. If the VIPService is not nil, the
-// existing comment is returned with the owner reference added, if not already
-// present. If the VIPService is not nil, but does not contain a comment we
-// return an error as this likely means that the VIPService was created by
-// somthing other than a Tailscale Kubernetes operator.
-func (r *HAIngressReconciler) ownerRefsComment(svc *tailscale.VIPService) (string, error) {
+// ownerAnnotations returns the updated annotations required to ensure this
+// instance of the operator is included as an owner. If the VIPService is not
+// nil, but does not contain an owner we return an error as this likely means
+// that the VIPService was created by somthing other than a Tailscale
+// Kubernetes operator.
+func (r *HAIngressReconciler) ownerAnnotations(svc *tailscale.VIPService) (map[string]string, error) {
 	ref := OwnerRef{
 		OperatorID: r.operatorID,
 	}
 	if svc == nil {
-		c := &comment{OwnerRefs: []OwnerRef{ref}}
+		c := ownerAnnotationValue{OwnerRefs: []OwnerRef{ref}}
 		json, err := json.Marshal(c)
 		if err != nil {
-			return "", fmt.Errorf("[unexpected] unable to marshal VIPService comment contents: %w, please report this", err)
+			return nil, fmt.Errorf("[unexpected] unable to marshal VIPService owner annotation contents: %w, please report this", err)
 		}
-		return string(json), nil
+		return map[string]string{
+			ownerAnnotation: string(json),
+		}, nil
 	}
-	c, err := parseComment(svc)
+	o, err := parseOwnerAnnotation(svc)
 	if err != nil {
-		return "", fmt.Errorf("error parsing existing VIPService comment: %w", err)
+		return nil, err
 	}
-	if c == nil || len(c.OwnerRefs) == 0 {
-		return "", fmt.Errorf("VIPService %s exists, but does not contain Comment field with owner references- not proceeding as this is likely a resource created by something other than a Tailscale Kubernetes Operator", svc.Name)
+	if o == nil || len(o.OwnerRefs) == 0 {
+		return nil, fmt.Errorf("VIPService %s exists, but does not contain owner annotation with owner references; not proceeding as this is likely a resource created by something other than the Tailscale Kubernetes operator", svc.Name)
 	}
-	if slices.Contains(c.OwnerRefs, ref) { // up to date
-		return svc.Comment, nil
+	if slices.Contains(o.OwnerRefs, ref) { // up to date
+		return svc.Annotations, nil
 	}
-	c.OwnerRefs = append(c.OwnerRefs, ref)
-	json, err := json.Marshal(c)
+	o.OwnerRefs = append(o.OwnerRefs, ref)
+	json, err := json.Marshal(o)
 	if err != nil {
-		return "", fmt.Errorf("error marshalling updated owner references: %w", err)
+		return nil, fmt.Errorf("error marshalling updated owner references: %w", err)
 	}
-	return string(json), nil
+
+	newAnnots := make(map[string]string, len(svc.Annotations)+1)
+	for k, v := range svc.Annotations {
+		newAnnots[k] = v
+	}
+	newAnnots[ownerAnnotation] = string(json)
+	return newAnnots, nil
 }
 
-// parseComment returns VIPService comment or nil if none found or not matching the expected format.
-func parseComment(vipSvc *tailscale.VIPService) (*comment, error) {
-	if vipSvc.Comment == "" {
+// parseOwnerAnnotation returns nil if no valid owner found.
+func parseOwnerAnnotation(vipSvc *tailscale.VIPService) (*ownerAnnotationValue, error) {
+	if vipSvc.Annotations == nil || vipSvc.Annotations[ownerAnnotation] == "" {
 		return nil, nil
 	}
-	c := &comment{}
-	if err := json.Unmarshal([]byte(vipSvc.Comment), c); err != nil {
-		return nil, fmt.Errorf("error parsing VIPService Comment field %q: %w", vipSvc.Comment, err)
+	o := &ownerAnnotationValue{}
+	if err := json.Unmarshal([]byte(vipSvc.Annotations[ownerAnnotation]), o); err != nil {
+		return nil, fmt.Errorf("error parsing VIPService %s annotation %q: %w", ownerAnnotation, vipSvc.Annotations[ownerAnnotation], err)
 	}
-	return c, nil
+	return o, nil
+}
+
+func ownersAreSetAndEqual(a, b *tailscale.VIPService) bool {
+	return a != nil && b != nil &&
+		a.Annotations != nil && b.Annotations != nil &&
+		a.Annotations[ownerAnnotation] != "" &&
+		b.Annotations[ownerAnnotation] != "" &&
+		strings.EqualFold(a.Annotations[ownerAnnotation], b.Annotations[ownerAnnotation])
+}
+
+// ensureCertResources ensures that the TLS Secret for an HA Ingress and RBAC
+// resources that allow proxies to manage the Secret are created.
+// Note that Tailscale VIPService name validation matches Kubernetes
+// resource name validation, so we can be certain that the VIPService name
+// (domain) is a valid Kubernetes resource name.
+// https://github.com/tailscale/tailscale/blob/8b1e7f646ee4730ad06c9b70c13e7861b964949b/util/dnsname/dnsname.go#L99
+// https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#dns-subdomain-names
+func (r *HAIngressReconciler) ensureCertResources(ctx context.Context, pgName, domain string) error {
+	secret := certSecret(pgName, r.tsNamespace, domain)
+	if _, err := createOrUpdate(ctx, r.Client, r.tsNamespace, secret, nil); err != nil {
+		return fmt.Errorf("failed to create or update Secret %s: %w", secret.Name, err)
+	}
+	role := certSecretRole(pgName, r.tsNamespace, domain)
+	if _, err := createOrUpdate(ctx, r.Client, r.tsNamespace, role, nil); err != nil {
+		return fmt.Errorf("failed to create or update Role %s: %w", role.Name, err)
+	}
+	rb := certSecretRoleBinding(pgName, r.tsNamespace, domain)
+	if _, err := createOrUpdate(ctx, r.Client, r.tsNamespace, rb, nil); err != nil {
+		return fmt.Errorf("failed to create or update RoleBinding %s: %w", rb.Name, err)
+	}
+	return nil
+}
+
+// cleanupCertResources ensures that the TLS Secret and associated RBAC
+// resources that allow proxies to read/write to the Secret are deleted.
+func (r *HAIngressReconciler) cleanupCertResources(ctx context.Context, pgName string, name tailcfg.ServiceName) error {
+	domainName, err := r.dnsNameForService(ctx, tailcfg.ServiceName(name))
+	if err != nil {
+		return fmt.Errorf("error getting DNS name for VIPService %s: %w", name, err)
+	}
+	labels := certResourceLabels(pgName, domainName)
+	if err := r.DeleteAllOf(ctx, &rbacv1.RoleBinding{}, client.InNamespace(r.tsNamespace), client.MatchingLabels(labels)); err != nil {
+		return fmt.Errorf("error deleting RoleBinding for domain name %s: %w", domainName, err)
+	}
+	if err := r.DeleteAllOf(ctx, &rbacv1.Role{}, client.InNamespace(r.tsNamespace), client.MatchingLabels(labels)); err != nil {
+		return fmt.Errorf("error deleting Role for domain name %s: %w", domainName, err)
+	}
+	if err := r.DeleteAllOf(ctx, &corev1.Secret{}, client.InNamespace(r.tsNamespace), client.MatchingLabels(labels)); err != nil {
+		return fmt.Errorf("error deleting Secret for domain name %s: %w", domainName, err)
+	}
+	return nil
 }
 
 // requeueInterval returns a time duration between 5 and 10 minutes, which is
@@ -810,4 +913,94 @@ func parseComment(vipSvc *tailscale.VIPService) (*comment, error) {
 // updates during multi-clutster Ingress create/update operations.
 func requeueInterval() time.Duration {
 	return time.Duration(rand.N(5)+5) * time.Minute
+}
+
+// certSecretRole creates a Role that will allow proxies to manage the TLS
+// Secret for the given domain. Domain must be a valid Kubernetes resource name.
+func certSecretRole(pgName, namespace, domain string) *rbacv1.Role {
+	return &rbacv1.Role{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      domain,
+			Namespace: namespace,
+			Labels:    certResourceLabels(pgName, domain),
+		},
+		Rules: []rbacv1.PolicyRule{
+			{
+				APIGroups:     []string{""},
+				Resources:     []string{"secrets"},
+				ResourceNames: []string{domain},
+				Verbs: []string{
+					"get",
+					"list",
+					"patch",
+					"update",
+				},
+			},
+		},
+	}
+}
+
+// certSecretRoleBinding creates a RoleBinding for Role that will allow proxies
+// to manage the TLS Secret for the given domain. Domain must be a valid
+// Kubernetes resource name.
+func certSecretRoleBinding(pgName, namespace, domain string) *rbacv1.RoleBinding {
+	return &rbacv1.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      domain,
+			Namespace: namespace,
+			Labels:    certResourceLabels(pgName, domain),
+		},
+		Subjects: []rbacv1.Subject{
+			{
+				Kind:      "ServiceAccount",
+				Name:      pgName,
+				Namespace: namespace,
+			},
+		},
+		RoleRef: rbacv1.RoleRef{
+			Kind: "Role",
+			Name: domain,
+		},
+	}
+}
+
+// certSecret creates a Secret that will store the TLS certificate and private
+// key for the given domain. Domain must be a valid Kubernetes resource name.
+func certSecret(pgName, namespace, domain string) *corev1.Secret {
+	labels := certResourceLabels(pgName, domain)
+	labels[kubetypes.LabelSecretType] = "certs"
+	return &corev1.Secret{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "v1",
+			Kind:       "Secret",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      domain,
+			Namespace: namespace,
+			Labels:    labels,
+		},
+		Data: map[string][]byte{
+			corev1.TLSCertKey:       nil,
+			corev1.TLSPrivateKeyKey: nil,
+		},
+		Type: corev1.SecretTypeTLS,
+	}
+}
+
+func certResourceLabels(pgName, domain string) map[string]string {
+	return map[string]string{
+		kubetypes.LabelManaged:      "true",
+		"tailscale.com/proxy-group": pgName,
+		"tailscale.com/domain":      domain,
+	}
+}
+
+// dnsNameForService returns the DNS name for the given VIPService name.
+func (r *HAIngressReconciler) dnsNameForService(ctx context.Context, svc tailcfg.ServiceName) (string, error) {
+	s := svc.WithoutPrefix()
+	tcd, err := r.tailnetCertDomain(ctx)
+	if err != nil {
+		return "", fmt.Errorf("error determining DNS name base: %w", err)
+	}
+	return s + "." + tcd, nil
 }
